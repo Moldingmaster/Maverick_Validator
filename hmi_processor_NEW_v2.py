@@ -30,11 +30,13 @@ import subprocess
 from datetime import datetime, date, timedelta
 import time
 import shutil
+import csv
 import re
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
+import traceback
 # Configuration
 PRESS_NUMBERS = [3, 4, 5, 6, 7, 8]
 OVEN_NUMBERS = [1, 2, 3]
@@ -62,6 +64,7 @@ PRESS7_IDLE_TONNAGE = float(os.environ.get("HMI_PRESS7_IDLE_TONNAGE", "10"))
 PRESS7_MIN_PRESSING_TONNAGE = float(os.environ.get("HMI_PRESS7_MIN_PRESSING_TONNAGE", "11"))
 PRESS7_MIN_CYCLE_TONNAGE = float(os.environ.get("HMI_PRESS7_MIN_CYCLE_TONNAGE", "20"))
 MAX_TIME_GAP_MINUTES = float(os.environ.get("HMI_MAX_TIME_GAP_MINUTES", "5"))
+STALE_IN_PROGRESS_MINUTES = float(os.environ.get("HMI_STALE_IN_PROGRESS_MINUTES", "180"))
 
 # NEW: Cycle detection thresholds
 TC_TEMP_THRESHOLD = 399  # Below this temp, cycle can end
@@ -72,11 +75,11 @@ MAX_LEADING_ZEROS = 3  # Capture up to 3 zeros before pressing
 MAX_TRAILING_ZEROS = 3  # Capture up to 3 zeros after pressing
 
 CLEAN_FAILURE_REPORTS_ON_START = os.environ.get("HMI_CLEAN_FAILURE_REPORTS_ON_START", "1").strip() not in ["0", "false", "False", "no", "NO"]
-FILE_BOUNDARY_GRACE_MINUTES = float(os.environ.get("HMI_FILE_BOUNDARY_GRACE_MINUTES", "5"))
 PREPEND_PREV_FILE_MINUTES = float(os.environ.get("HMI_PREPEND_PREV_FILE_MINUTES", "120"))
 APPEND_NEXT_FILE_MINUTES = float(os.environ.get("HMI_APPEND_NEXT_FILE_MINUTES", "720"))
 MAX_REALISTIC_TEMP_F = float(os.environ.get("HMI_MAX_REALISTIC_TEMP_F", "1500"))
 MIN_ACTIVE_TC_SAMPLES = int(os.environ.get("HMI_MIN_ACTIVE_TC_SAMPLES", "5"))
+ACTIVE_TC_MIN_TEMP_F = float(os.environ.get("HMI_ACTIVE_TC_MIN_TEMP_F", str(TC_TEMP_THRESHOLD)))
 MIN_CYCLE_PRESSING_TONNAGE = float(os.environ.get("HMI_MIN_CYCLE_PRESSING_TONNAGE", "5"))
 TONNAGE_UNRELIABLE_PRESSES = set(
     int(x.strip())
@@ -86,6 +89,7 @@ TONNAGE_UNRELIABLE_PRESSES = set(
 
 _last_seen_file_signature = {}
 _last_processed_ts = {}
+_results_index_lock = threading.Lock()
 
 
 def load_process_state(path: str):
@@ -148,12 +152,13 @@ def cleanup_failure_reports(output_base: str) -> int:
             return 0
 
         for root, _dirs, files in os.walk(output_base):
-            if "FAILURE_REPORT.txt" in files:
-                try:
-                    os.remove(os.path.join(root, "FAILURE_REPORT.txt"))
-                    removed += 1
-                except Exception:
-                    continue
+            for fname in files:
+                if fname == "FAILURE_REPORT.txt" or fname.startswith("FAILURE_REPORT_ARCHIVED_"):
+                    try:
+                        os.remove(os.path.join(root, fname))
+                        removed += 1
+                    except Exception:
+                        continue
     except Exception:
         return removed
 
@@ -325,22 +330,19 @@ def is_cycle_complete(cycle_df, tonnage_col, press_number=None):
         tonnage = clean_numeric_column(window_df[tonnage_col]).fillna(0)
         tonnage_idle = (tonnage <= idle_threshold).all()
 
-        temp_cols = [c for c in window_df.columns if 'TEMP' in c.upper() or 'TC' in c.upper()]
+        temp_cols = _get_temperature_columns(window_df)
         if not temp_cols:
             return False
 
-        temps_window = window_df[temp_cols].apply(clean_numeric_column)
+        temps_window, active_cols = _get_active_temperature_columns(window_df, temp_cols)
+        if not active_cols:
+            return False
 
         all_zero_window = tonnage_idle and (temps_window.fillna(0) == 0).all().all()
         if all_zero_window:
             return True
 
-        temps_full = cycle_df[temp_cols].apply(clean_numeric_column)
-        active_cols = [c for c in temp_cols if temps_full[c].fillna(0).abs().max() > 0]
-        if not active_cols:
-            return False
-
-        temps_active_window = temps_window[active_cols].mask(temps_window[active_cols] == 0)
+        temps_active_window = temps_window[active_cols]
         temps_active_ok = temps_active_window.notna().all(axis=1) & (temps_active_window < TC_TEMP_THRESHOLD).all(axis=1)
         return tonnage_idle and temps_active_ok.all()
     except Exception:
@@ -463,31 +465,99 @@ def get_tool_quantity(part_number, program_df):
         return 1
     try:
         match = program_df.loc[program_df['Program'] == part_number]
-        if not match.empty:
-            tool_col = None
-            for c in match.columns:
-                if str(c).strip().lower() == 'tool quantity':
-                    tool_col = c
-                    break
-            if tool_col is None:
-                for c in match.columns:
-                    s = str(c).strip().lower()
-                    if 'tool' in s and ('qty' in s or 'quantity' in s):
-                        tool_col = c
-                        break
-            if tool_col is None:
-                return 1
+        if match.empty:
+            return 1
 
-            raw_val = match[tool_col].values[0]
+        def _parse_qty(raw_val):
             qty = pd.to_numeric(raw_val, errors='coerce')
             if pd.notna(qty):
-                return int(float(qty))
+                try:
+                    q = int(float(qty))
+                    return q
+                except Exception:
+                    return None
 
             s = str(raw_val)
+            m_mul = re.search(r"(\d+)\s*[xX\*]\s*(\d+)", s)
+            if m_mul:
+                try:
+                    a = int(m_mul.group(1))
+                    b = int(m_mul.group(2))
+                    if a > 0 and b > 0:
+                        return int(a * b)
+                except Exception:
+                    return None
             m = re.search(r"(\d+)", s)
             if m:
-                return int(m.group(1))
-            return 1
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    return None
+            return None
+
+        def _is_plausible_tool_qty(q):
+            try:
+                q = int(q)
+            except Exception:
+                return False
+            return 1 <= q <= 200
+
+        def _col_score(col_name):
+            s = str(col_name).strip().lower()
+            score = 0
+            if any(k in s for k in ['tool', 'cav', 'cavity', 'cavities', 'nest', 'stack']):
+                score += 10
+            if any(k in s for k in ['qty', 'quantity', 'count', 'total', 'num', 'number', '#', 'no.']):
+                score += 5
+            if any(k in s for k in ['temp', 'ton', 'time', 'min', 'max', 'range', 'heat', 'hold', 'soak', 'deg', '°', 'f']):
+                score -= 20
+            return score
+
+        tool_cols = []
+        for c in match.columns:
+            s = str(c).strip().lower()
+            if any(k in s for k in ['tool', 'cav', 'cavity', 'cavities', 'nest', 'stack']):
+                if any(k in s for k in ['qty', 'quantity', 'count', 'total', 'num', 'number', '#', 'no.']):
+                    tool_cols.append(c)
+
+        if not tool_cols:
+            for c in match.columns:
+                if _col_score(c) >= 10:
+                    tool_cols.append(c)
+
+        if not tool_cols:
+            tool_cols = []
+
+        best_qty = None
+        best_score = None
+        for tool_col in tool_cols:
+            raw_val = match[tool_col].values[0]
+            q = _parse_qty(raw_val)
+            if q is None or not _is_plausible_tool_qty(q):
+                continue
+            sc = _col_score(tool_col)
+            if best_qty is None or sc > best_score or (sc == best_score and q > best_qty):
+                best_qty = q
+                best_score = sc
+
+        if best_qty is not None:
+            return best_qty
+
+        row = match.iloc[0]
+        best_qty = None
+        best_score = None
+        for c in match.columns:
+            q = _parse_qty(row[c])
+            if q is None or not _is_plausible_tool_qty(q):
+                continue
+            sc = _col_score(c)
+            if sc < 0:
+                continue
+            if best_qty is None or sc > best_score or (sc == best_score and q > best_qty):
+                best_qty = q
+                best_score = sc
+
+        return best_qty if best_qty is not None else 1
     except Exception:
         pass
     safe_print(f"WARNING: Tool quantity not found for {part_number}, using default value 1")
@@ -528,6 +598,8 @@ def extract_conditions(steps, num_tools):
                 tolerance = total_tons * 0.03
                 conditions.append({
                     'type': 'tonnage',
+                    'tons_per_tool': tons_per_tool,
+                    'num_tools': num_tools,
                     'tons_range': (total_tons - tolerance, total_tons + tolerance),
                     'temp_range': (temp - 20, temp + 40),
                     'duration': None,
@@ -559,6 +631,76 @@ def extract_conditions(steps, num_tools):
     return conditions
 
 
+def _infer_effective_tool_count_from_tonnage(cycle_df, tonnage_col, press_number, conditions, current_num_tools):
+    try:
+        if not conditions:
+            return current_num_tools, conditions
+        ton_conds = [c for c in conditions if c.get('type') == 'tonnage']
+        if not ton_conds:
+            return current_num_tools, conditions
+
+        base = ton_conds[0]
+        tons_per_tool = base.get('tons_per_tool')
+        if tons_per_tool is None:
+            return current_num_tools, conditions
+
+        cycle_pressing_threshold = get_cycle_pressing_threshold(press_number)
+        t_series = clean_numeric_column(cycle_df[tonnage_col]).fillna(0)
+        pressing_tonnage = t_series[t_series > cycle_pressing_threshold]
+        if pressing_tonnage.empty:
+            return current_num_tools, conditions
+
+        pressing_med = float(pressing_tonnage.median())
+        if pressing_med <= 0:
+            return current_num_tools, conditions
+
+        expected_center = None
+        try:
+            tr = base.get('tons_range')
+            if tr is not None and len(tr) == 2:
+                expected_center = (float(tr[0]) + float(tr[1])) / 2.0
+        except Exception:
+            expected_center = None
+
+        if expected_center is None or expected_center <= 0:
+            return current_num_tools, conditions
+
+        ratio = pressing_med / expected_center
+        if ratio < 1.8 and ratio > (1.0 / 1.8):
+            return current_num_tools, conditions
+
+        implied_tools = int(round(pressing_med / float(tons_per_tool)))
+        if implied_tools < 1 or implied_tools > 200:
+            return current_num_tools, conditions
+
+        implied_total = float(tons_per_tool) * float(implied_tools)
+        if implied_total <= 0:
+            return current_num_tools, conditions
+
+        tol = implied_total * 0.03
+        low = implied_total - tol
+        high = implied_total + tol
+        if not (low <= pressing_med <= high):
+            return current_num_tools, conditions
+
+        updated = []
+        for c in conditions:
+            if c.get('type') == 'tonnage' and c.get('tons_per_tool') is not None:
+                tp = float(c.get('tons_per_tool'))
+                tot = tp * float(implied_tools)
+                t_tol = tot * 0.03
+                cc = dict(c)
+                cc['num_tools'] = implied_tools
+                cc['tons_range'] = (tot - t_tol, tot + t_tol)
+                updated.append(cc)
+            else:
+                updated.append(c)
+
+        return implied_tools, updated
+    except Exception:
+        return current_num_tools, conditions
+
+
 def _get_temperature_columns(session_group):
     cols = []
     for c in session_group.columns:
@@ -579,8 +721,16 @@ def _get_active_temperature_columns(session_group, temp_cols):
     active = []
     for c in temp_cols:
         try:
-            if int(temps_df[c].notna().sum()) >= MIN_ACTIVE_TC_SAMPLES:
-                active.append(c)
+            s = temps_df[c]
+            if int(s.notna().sum()) < MIN_ACTIVE_TC_SAMPLES:
+                continue
+            try:
+                max_temp = float(s.max())
+            except Exception:
+                max_temp = float("nan")
+            if pd.isna(max_temp) or max_temp < ACTIVE_TC_MIN_TEMP_F:
+                continue
+            active.append(c)
         except Exception:
             continue
     return temps_df, active
@@ -589,17 +739,95 @@ def _get_active_temperature_columns(session_group, temp_cols):
 def _max_continuous_minutes(mask, time_index):
     current_duration = 0.0
     max_duration = 0.0
-    for i in range(1, len(mask)):
-        if mask.iloc[i]:
+
+    typical_delta = 1.0
+    try:
+        deltas = []
+        for i in range(1, len(mask)):
             delta = (time_index[i] - time_index[i - 1]).total_seconds() / 60
             if delta <= 1.5:
+                deltas.append(float(delta))
+        if deltas:
+            typical_delta = float(pd.Series(deltas).median())
+    except Exception:
+        typical_delta = 1.0
+
+    for i in range(len(mask)):
+        if not bool(mask.iloc[i]):
+            current_duration = 0.0
+            continue
+
+        if i == 0:
+            current_duration = typical_delta
+        else:
+            delta = (time_index[i] - time_index[i - 1]).total_seconds() / 60
+            if bool(mask.iloc[i - 1]) and delta <= 1.5:
                 current_duration += delta
             else:
-                current_duration = 0.0
-        else:
-            current_duration = 0.0
+                current_duration = typical_delta
+
         max_duration = max(max_duration, current_duration)
+
     return max_duration
+
+
+def _widen_tonnage_range_if_close(cycle_df, tonnage_col, press_number, conditions, max_extra_tol=0.06):
+    try:
+        if not conditions:
+            return conditions
+        if tonnage_col is None or tonnage_col not in cycle_df.columns:
+            return conditions
+
+        cycle_pressing_threshold = get_cycle_pressing_threshold(press_number)
+        t_series = clean_numeric_column(cycle_df[tonnage_col]).fillna(0)
+        pressing = t_series[t_series > cycle_pressing_threshold]
+        if pressing.empty:
+            return conditions
+
+        pressing_med = float(pressing.median())
+        if pressing_med <= 0:
+            return conditions
+
+        updated = []
+        for c in conditions:
+            if c.get('type') != 'tonnage':
+                updated.append(c)
+                continue
+
+            tr = c.get('tons_range')
+            if tr is None or len(tr) != 2:
+                updated.append(c)
+                continue
+
+            low = float(tr[0])
+            high = float(tr[1])
+            if low <= pressing_med <= high:
+                updated.append(c)
+                continue
+
+            center = (low + high) / 2.0
+            if center <= 0:
+                updated.append(c)
+                continue
+
+            ratio = pressing_med / center
+            diff = abs(ratio - 1.0)
+            if diff > float(max_extra_tol):
+                updated.append(c)
+                continue
+
+            # Widen just enough (bounded) to include observed median
+            tol = max(0.03, min(float(max_extra_tol), diff + 0.01))
+            new_low = center * (1.0 - tol)
+            new_high = center * (1.0 + tol)
+
+            cc = dict(c)
+            cc['tons_range'] = (new_low, new_high)
+            updated.append(cc)
+
+        return updated
+    except Exception:
+        return conditions
 
 
 def evaluate_conditions_progress(session_group, conditions, press_number=None):
@@ -653,29 +881,30 @@ def evaluate_conditions_progress(session_group, conditions, press_number=None):
                 debug[cond_key] = {"met": False, "reason": "missing_range"}
                 continue
 
-            per_col_ok = (temps_df[active_cols] >= cond['range'][0]) & (temps_df[active_cols] <= cond['range'][1])
-            in_range = per_col_ok.all(axis=1)
+            if cond['type'] == 'soak':
+                # Soak is evaluated on the average of active TCs (ignoring <=0 artifacts)
+                try:
+                    temp_matrix = temps_df[active_cols].mask(temps_df[active_cols] <= 0)
+                    avg_temp = temp_matrix.mean(axis=1, skipna=True)
+                    in_range = (avg_temp >= cond['range'][0]) & (avg_temp <= cond['range'][1])
+                except Exception:
+                    per_col_ok = (temps_df[active_cols] >= cond['range'][0]) & (temps_df[active_cols] <= cond['range'][1])
+                    in_range = per_col_ok.all(axis=1)
+            else:
+                per_col_ok = (temps_df[active_cols] >= cond['range'][0]) & (temps_df[active_cols] <= cond['range'][1])
+                in_range = per_col_ok.all(axis=1)
 
             if cond.get('duration'):
                 if cond['type'] == 'soak':
                     max_duration_achieved = _max_continuous_minutes(in_range, time_index)
                     met = max_duration_achieved >= float(cond['duration'])
                 else:
-                    current_duration = 0.0
-                    for i in range(1, len(in_range)):
-                        if in_range.iloc[i]:
-                            delta = (time_index[i] - time_index[i - 1]).total_seconds() / 60
-                            if delta <= 1.5:
-                                current_duration += delta
-                            else:
-                                current_duration = 0.0
-                        else:
-                            current_duration = 0.0
-                        max_duration_achieved = max(max_duration_achieved, current_duration)
-
-                        if cond['duration'][0] <= current_duration <= cond['duration'][1]:
-                            met = True
-                            break
+                    try:
+                        min_required = float(cond['duration'][0]) if isinstance(cond['duration'], tuple) else float(cond['duration'])
+                    except Exception:
+                        min_required = float(cond['duration'][0])
+                    max_duration_achieved = _max_continuous_minutes(in_range, time_index)
+                    met = max_duration_achieved >= min_required
             else:
                 met = bool(in_range.any())
 
@@ -705,27 +934,28 @@ def evaluate_conditions_progress(session_group, conditions, press_number=None):
             tonnage = clean_numeric_column(session_group[tonnage_col])
             tonnage_ok = (tonnage >= cond['tons_range'][0]) & (tonnage <= cond['tons_range'][1])
 
-            per_col_temp_ok = (temps_df[active_cols] >= cond['temp_range'][0]) & (temps_df[active_cols] <= cond['temp_range'][1])
-            temp_ok = per_col_temp_ok.all(axis=1)
+            temp_ok = None
+            if 'TOOL TEMP' in session_group.columns:
+                try:
+                    tool_temp = clean_numeric_column(session_group['TOOL TEMP'])
+                    if tool_temp.notna().any():
+                        temp_ok = (tool_temp >= cond['temp_range'][0]) & (tool_temp <= cond['temp_range'][1])
+                except Exception:
+                    temp_ok = None
+
+            if temp_ok is None:
+                per_col_temp_ok = (temps_df[active_cols] >= cond['temp_range'][0]) & (temps_df[active_cols] <= cond['temp_range'][1])
+                temp_ok = per_col_temp_ok.all(axis=1)
 
             in_range = tonnage_ok & temp_ok
 
             if cond.get('duration'):
-                current_duration = 0.0
-                for i in range(1, len(in_range)):
-                    if in_range.iloc[i]:
-                        delta = (time_index[i] - time_index[i - 1]).total_seconds() / 60
-                        if delta <= 1.5:
-                            current_duration += delta
-                        else:
-                            current_duration = 0.0
-                    else:
-                        current_duration = 0.0
-                    max_duration_achieved = max(max_duration_achieved, current_duration)
-
-                    if cond['duration'][0] <= current_duration <= cond['duration'][1]:
-                        met = True
-                        break
+                try:
+                    min_required = float(cond['duration'][0]) if isinstance(cond['duration'], tuple) else float(cond['duration'])
+                except Exception:
+                    min_required = float(cond['duration'][0])
+                max_duration_achieved = _max_continuous_minutes(in_range, time_index)
+                met = max_duration_achieved >= min_required
             else:
                 met = bool(in_range.any())
 
@@ -858,10 +1088,7 @@ def validate_conditions_with_duration(session_group, conditions, press_number=No
         if cond['type'] == 'temperature':
             temp_cols = [c for c in session_group.columns if 'TEMP' in c.upper() or 'TC' in c.upper()]
             if temp_cols:
-                temps_df = session_group[temp_cols].copy()
-                temps_df = temps_df.mask(temps_df == 0)
-
-                active_cols = [c for c in temp_cols if temps_df[c].notna().any()]
+                temps_df, active_cols = _get_active_temperature_columns(session_group, temp_cols)
                 if not active_cols:
                     failures.append("No active temperature columns found")
                     status = "Fail"
@@ -894,21 +1121,31 @@ def validate_conditions_with_duration(session_group, conditions, press_number=No
                 tonnage_ok = (tonnage >= cond['tons_range'][0]) & (tonnage <= cond['tons_range'][1])
 
                 temp_cols = [c for c in session_group.columns if 'TEMP' in c.upper() or 'TC' in c.upper()]
-                temps_df = session_group[temp_cols].copy() if temp_cols else pd.DataFrame(index=session_group.index)
-                if not temps_df.empty:
-                    temps_df = temps_df.mask(temps_df == 0)
-                    active_cols = [c for c in temp_cols if temps_df[c].notna().any()]
+                if temp_cols:
+                    temps_df, active_cols = _get_active_temperature_columns(session_group, temp_cols)
                 else:
+                    temps_df = pd.DataFrame(index=session_group.index)
                     active_cols = []
 
                 temp_ok = pd.Series(True, index=session_group.index)
                 if cond.get('temp_range') is not None:
-                    if not active_cols:
-                        failures.append("No active temperature columns found for tonnage validation")
-                        status = "Fail"
-                        continue
-                    per_col_temp_ok = (temps_df[active_cols] >= cond['temp_range'][0]) & (temps_df[active_cols] <= cond['temp_range'][1])
-                    temp_ok = per_col_temp_ok.all(axis=1)
+                    used_tool_temp = False
+                    if 'TOOL TEMP' in session_group.columns:
+                        try:
+                            tool_temp = clean_numeric_column(session_group['TOOL TEMP'])
+                            if tool_temp.notna().any():
+                                temp_ok = (tool_temp >= cond['temp_range'][0]) & (tool_temp <= cond['temp_range'][1])
+                                used_tool_temp = True
+                        except Exception:
+                            used_tool_temp = False
+
+                    if not used_tool_temp:
+                        if not active_cols:
+                            failures.append("No active temperature columns found for tonnage validation")
+                            status = "Fail"
+                            continue
+                        per_col_temp_ok = (temps_df[active_cols] >= cond['temp_range'][0]) & (temps_df[active_cols] <= cond['temp_range'][1])
+                        temp_ok = per_col_temp_ok.all(axis=1)
 
                 in_range = tonnage_ok & temp_ok
                 # Get actual max tonnage (excluding zeros - we want the pressing tonnage)
@@ -924,31 +1161,13 @@ def validate_conditions_with_duration(session_group, conditions, press_number=No
                 continue
 
         if cond.get('duration'):
-            sustained = False
-            current_duration = 0
-            max_duration_achieved = 0
-            for i in range(1, len(in_range)):
-                if in_range.iloc[i]:
-                    delta = (time_index[i] - time_index[i - 1]).total_seconds() / 60
-                    if delta <= 1.5:
-                        current_duration += delta
-                    else:
-                        current_duration = 0
-                else:
-                    current_duration = 0
-                
-                max_duration_achieved = max(max_duration_achieved, current_duration)
+            max_duration_achieved = _max_continuous_minutes(in_range, time_index)
+            try:
+                min_required = float(cond['duration'][0]) if isinstance(cond['duration'], tuple) else float(cond['duration'])
+            except Exception:
+                min_required = float(cond['duration'][0])
 
-                if isinstance(cond['duration'], tuple):
-                    if cond['duration'][0] <= current_duration <= cond['duration'][1]:
-                        sustained = True
-                        break
-                else:
-                    if current_duration >= cond['duration']:
-                        sustained = True
-                        break
-
-            if not sustained:
+            if max_duration_achieved < min_required:
                 status = "Fail"
                 if cond['type'] == 'temperature' and cond.get('range'):
                     failures.append(f"Temp hold failed: needed {cond['duration']} min at {cond['range'][0]}-{cond['range'][1]}°F, achieved {max_duration_achieved:.1f} min")
@@ -1016,7 +1235,7 @@ def calculate_tc_average(df, tc_cols):
     
     # Convert TC columns to numeric using the clean function
     tc_data = df[tc_cols].apply(clean_numeric_column)
-    tc_data = tc_data.mask(tc_data == 0)
+    tc_data = tc_data.mask((tc_data == 0) | (tc_data > MAX_REALISTIC_TEMP_F) | (tc_data < -50))
     
     # Calculate mean across TC columns
     tc_avg = tc_data.mean(axis=1).fillna(0)
@@ -1025,6 +1244,8 @@ def calculate_tc_average(df, tc_cols):
 
 
 def get_idle_tonnage_threshold(press_number):
+    if press_number == 5:
+        return PRESS5_IDLE_TONNAGE_DISPLAY
     if press_number == 7:
         return PRESS7_IDLE_TONNAGE
     return TONNAGE_ZERO
@@ -1073,7 +1294,9 @@ def split_into_cycles(df, tc_cols, tonnage_col, press_number=None):
     active_cols = []
     if tc_cols:
         try:
-            temps_raw = df[tc_cols].apply(clean_numeric_column).fillna(0)
+            temps_raw = df[tc_cols].apply(clean_numeric_column)
+            temps_raw = temps_raw.mask((temps_raw > MAX_REALISTIC_TEMP_F) | (temps_raw < -50))
+            temps_raw = temps_raw.fillna(0)
             temps_df = temps_raw.mask(temps_raw == 0)
             active_cols = [c for c in tc_cols if temps_df[c].notna().any()]
         except Exception:
@@ -1213,11 +1436,20 @@ def create_failure_report(output_folder, press_number, part_number, first_date, 
         try:
             if os.path.exists(report_path):
                 os.remove(report_path)
+            for f in os.listdir(output_folder):
+                if f.startswith("FAILURE_REPORT_ARCHIVED_"):
+                    try:
+                        os.remove(os.path.join(output_folder, f))
+                    except Exception:
+                        pass
         except Exception:
             pass
         return  # No report needed for passing jobs
     
     try:
+        if not failure_details:
+            failure_details = ["Failure reason not available"]
+
         with open(report_path, 'w') as f:
             f.write("=" * 70 + "\n")
             f.write("                    VALIDATION FAILURE REPORT\n")
@@ -1308,6 +1540,76 @@ def create_failure_report(output_folder, press_number, part_number, first_date, 
         safe_print(f"  WARNING: Could not create failure report: {e}")
 
 
+def _write_status_file(output_folder, press_number, part_number, first_date, pass_status, failure_details):
+    try:
+        status_path = os.path.join(output_folder, "STATUS.txt")
+        with open(status_path, "w", encoding="utf-8") as f:
+            f.write(f"Press: {press_number}\n")
+            f.write(f"Part Number: {part_number}\n")
+            f.write(f"Date: {first_date}\n")
+            f.write(f"Status: {pass_status}\n")
+            f.write(f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            if failure_details:
+                f.write("Reasons:\n")
+                for i, d in enumerate(failure_details, 1):
+                    f.write(f"  {i}. {d}\n")
+        return True
+    except Exception:
+        return False
+
+
+def _append_results_index(press_number, output_folder, pass_status, failure_details, cycle_df, source_filename):
+    try:
+        press_root = os.path.join(OUTPUT_BASE, f"Press_{press_number}")
+        os.makedirs(press_root, exist_ok=True)
+
+        folder_name = os.path.basename(output_folder.rstrip("\\/"))
+        chart_exists = os.path.isfile(os.path.join(output_folder, "chart.pdf"))
+        report_exists = os.path.isfile(os.path.join(output_folder, "FAILURE_REPORT.txt"))
+
+        try:
+            start_ts = cycle_df.index[0].strftime('%Y-%m-%d %H:%M:%S')
+            end_ts = cycle_df.index[-1].strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            start_ts = ""
+            end_ts = ""
+
+        reasons = " | ".join([str(x) for x in (failure_details or [])])
+
+        row = {
+            "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "press": press_number,
+            "folder": folder_name,
+            "output_folder": output_folder,
+            "status": pass_status,
+            "start": start_ts,
+            "end": end_ts,
+            "reasons": reasons,
+            "failure_report": "1" if report_exists else "0",
+            "chart_pdf": "1" if chart_exists else "0",
+            "source_file": source_filename or "",
+        }
+
+        headers = list(row.keys())
+        targets = [
+            os.path.join(press_root, "results_index.csv"),
+            os.path.join(OUTPUT_BASE, "results_index_all.csv"),
+        ]
+
+        with _results_index_lock:
+            for target in targets:
+                write_header = not os.path.exists(target)
+                with open(target, "a", encoding="utf-8", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=headers)
+                    if write_header:
+                        w.writeheader()
+                    w.writerow(row)
+
+        return True
+    except Exception:
+        return False
+
+
 def process_press_file_robust(filepath, press_number, program_df=None):
     """Process press file with robust error handling and NEW cycle detection"""
     try:
@@ -1324,23 +1626,50 @@ def process_press_file_robust(filepath, press_number, program_df=None):
         original_file_end = df.index.max()
 
         stitched_df = df
-        prev_path = get_adjacent_daily_file_path(filepath, -1)
-        if prev_path and os.path.exists(prev_path) and is_file_stable_for_processing(prev_path):
-            prev_df = load_press_dataframe(prev_path)
-            if prev_df is not None and not prev_df.empty:
-                cutoff = original_file_start - timedelta(minutes=PREPEND_PREV_FILE_MINUTES)
-                prev_tail = prev_df.loc[prev_df.index >= cutoff]
-                if not prev_tail.empty:
-                    stitched_df = pd.concat([prev_tail, stitched_df], axis=0)
+        try:
+            press_dir = os.path.dirname(filepath)
+            base = os.path.basename(filepath)
 
-        next_path = get_adjacent_daily_file_path(filepath, 1)
-        if next_path and os.path.exists(next_path) and is_file_stable_for_processing(next_path):
-            next_df = load_press_dataframe(next_path)
-            if next_df is not None and not next_df.empty:
-                cutoff = original_file_end + timedelta(minutes=APPEND_NEXT_FILE_MINUTES)
-                next_head = next_df.loc[next_df.index <= cutoff]
-                if not next_head.empty:
-                    stitched_df = pd.concat([stitched_df, next_head], axis=0)
+            # Include same-date files (common for noon/midday rollovers) + +/-1 day
+            datecodes = set()
+            m = list(re.finditer(r"\d{6}", base))
+            if m:
+                cur_code = m[-1].group(0)
+                datecodes.add(cur_code)
+                cur_date = _parse_yymmdd_datecode(cur_code)
+                if cur_date is not None:
+                    datecodes.add(_format_yymmdd_datecode(cur_date + timedelta(days=-1)))
+                    datecodes.add(_format_yymmdd_datecode(cur_date + timedelta(days=1)))
+
+            desired_start = original_file_start - timedelta(minutes=PREPEND_PREV_FILE_MINUTES)
+            desired_end = original_file_end + timedelta(minutes=APPEND_NEXT_FILE_MINUTES)
+
+            candidates = []
+            for fn in os.listdir(press_dir):
+                if not fn.lower().endswith('.txt'):
+                    continue
+                if fn == base:
+                    continue
+                if datecodes and (not any(dc in fn for dc in datecodes)):
+                    continue
+                full = os.path.join(press_dir, fn)
+                candidates.append(full)
+
+            # Deterministic stitch order
+            candidates.sort(key=lambda p: (os.path.getmtime(p), os.path.getsize(p)))
+
+            for p in candidates:
+                other_df = load_press_dataframe(p)
+                if other_df is None or other_df.empty:
+                    continue
+                other_slice = other_df.loc[(other_df.index >= desired_start) & (other_df.index <= desired_end)]
+                if other_slice.empty:
+                    continue
+                stitched_df = pd.concat([stitched_df, other_slice], axis=0)
+                safe_print(f"  Stitched {len(other_slice)} rows from {os.path.basename(p)}")
+        except Exception as _stitch_err:
+            safe_print(f"  WARNING: Stitch failed: {_stitch_err}")
+            stitched_df = df
 
         if stitched_df is not df:
             stitched_df = stitched_df[~stitched_df.index.duplicated(keep='last')].sort_index()
@@ -1452,6 +1781,16 @@ def process_press_file_robust(filepath, press_number, program_df=None):
                         raw_steps = program_df.loc[program_df['Program'] == pn_int].iloc[0, 3:].tolist()
                         steps = [s for s in raw_steps if isinstance(s, str) and str(s).strip()]
                         conditions = extract_conditions(steps, num_tools)
+                        try:
+                            num_tools, conditions = _infer_effective_tool_count_from_tonnage(
+                                cycle_df, tonnage_col, press_number, conditions, num_tools
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            conditions = _widen_tonnage_range_if_close(cycle_df, tonnage_col, press_number, conditions)
+                        except Exception:
+                            pass
                     else:
                         conditions = None
                         num_tools = None
@@ -1466,29 +1805,10 @@ def process_press_file_robust(filepath, press_number, program_df=None):
                     except Exception:
                         pass
 
-                partial_reason = None
-                try:
-                    cycle_pressing_threshold = get_cycle_pressing_threshold(press_number)
-                    t_series = clean_numeric_column(cycle_df[tonnage_col]).fillna(0)
-                    cycle_tc_avg = calculate_tc_average(cycle_df, tc_cols) if tc_cols else pd.Series(0, index=cycle_df.index)
-
-                    file_start = original_file_start
-                    file_end = original_file_end
-                    grace = timedelta(minutes=FILE_BOUNDARY_GRACE_MINUTES)
-
-                    if cycle_df.index.min() <= (file_start + grace):
-                        if t_series.iloc[0] > cycle_pressing_threshold and float(cycle_tc_avg.iloc[0]) >= TC_TEMP_THRESHOLD:
-                            partial_reason = "Partial cycle (started before file began)"
-                    if partial_reason is None and cycle_df.index.max() >= (file_end - grace):
-                        if t_series.iloc[-1] > cycle_pressing_threshold or float(cycle_tc_avg.iloc[-1]) >= TC_TEMP_THRESHOLD:
-                            partial_reason = "Partial cycle (ended after file stopped)"
-                except Exception:
-                    partial_reason = None
-
                 soak_text = None
                 open_time = detect_press_open_time(cycle_df, tonnage_col, press_number=press_number, minutes_required=3)
                 cycle_complete = is_cycle_complete(cycle_df, tonnage_col, press_number=press_number)
-                if time_since_last_data >= 60 and partial_reason is None:
+                if time_since_last_data >= 60:
                     try:
                         idle_threshold = get_idle_tonnage_threshold(press_number)
                         last_tonnage = float(clean_numeric_column(cycle_df[tonnage_col]).fillna(0).iloc[-1])
@@ -1537,10 +1857,6 @@ def process_press_file_robust(filepath, press_number, program_df=None):
                         else:
                             failure_details = unmet_reasons
 
-                if partial_reason is not None and open_time is None:
-                    pass_status = "In Progress"
-                    failure_details = [partial_reason]
-
                 if tonnage_unreliable and (not missing_part_number):
                     if pass_status == "Fail":
                         pass_status = "In Progress"
@@ -1559,6 +1875,13 @@ def process_press_file_robust(filepath, press_number, program_df=None):
                 
                 # Create or cleanup failure report
                 create_failure_report(output_folder, press_number, clean_part_number if missing_part_number else pn_int, first_date, pass_status, failure_details, cycle_df, conditions, num_tools)
+
+                try:
+                    display_part = clean_part_number if missing_part_number else str(pn_int)
+                    _write_status_file(output_folder, press_number, display_part, first_date, pass_status, failure_details)
+                    _append_results_index(press_number, output_folder, pass_status, failure_details, cycle_df, filename)
+                except Exception:
+                    pass
                 
                 # Create chart
                 chart_success = create_robust_chart(cycle_df, press_number, clean_part_number if missing_part_number else pn_int, first_date, output_folder, pass_status, failure_details, soak_text=soak_text)
@@ -2305,17 +2628,24 @@ def main():
             processed_press_map, processed_oven_map = load_process_state(PROCESS_STATE_PATH)
 
         while True:
-            safe_print(f"\nCycle start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            processed, failed, new_items = process_all_files_robust(processed_press_map, processed_oven_map, program_df, oven_df, startup_date)
-            safe_print(f"Cycle summary: processed={processed}, failed={failed}")
-            if not REPROCESS_ON_START:
-                save_process_state(PROCESS_STATE_PATH, processed_press_map, processed_oven_map)
-            if new_items == 0:
-                safe_print(f"No new files. Next check in {WATCH_INTERVAL_SECONDS} seconds.")
-            else:
-                safe_print(f"New files processed: {new_items}. Next check in {WATCH_INTERVAL_SECONDS} seconds.")
-            time.sleep(WATCH_INTERVAL_SECONDS)
+            try:
+                safe_print(f"\nCycle start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                processed, failed, new_items = process_all_files_robust(processed_press_map, processed_oven_map, program_df, oven_df, startup_date)
+                safe_print(f"Cycle summary: processed={processed}, failed={failed}")
+                if not REPROCESS_ON_START:
+                    save_process_state(PROCESS_STATE_PATH, processed_press_map, processed_oven_map)
+                if new_items == 0:
+                    safe_print(f"No new files. Next check in {WATCH_INTERVAL_SECONDS} seconds.")
+                else:
+                    safe_print(f"New files processed: {new_items}. Next check in {WATCH_INTERVAL_SECONDS} seconds.")
+            except Exception as e:
+                safe_print(f"\nERROR: Cycle crashed: {e}")
+                traceback.print_exc()
 
+            try:
+                time.sleep(WATCH_INTERVAL_SECONDS)
+            except Exception:
+                time.sleep(30)
     except KeyboardInterrupt:
         safe_print("\nINFO: Process interrupted")
     except Exception as e:
