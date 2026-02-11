@@ -1,4 +1,20 @@
+#!/usr/bin/env python3
+"""
+HMI PROCESSOR WITH NEW CYCLE DETECTION LOGIC - FIXED VERSION v2
+Properly splits production runs based on tonnage and temperature patterns
+Discards waste data between runs
 
+FIXES APPLIED:
+- UTF-16 encoding support for HMI files
+- clean_numeric_column helper to strip null bytes before numeric conversion
+- Column name normalization (strip BOM, null bytes)
+- Fixed lookback logic for leading zeros (iterate backwards)
+- Filter out cycles that never had pressing
+- Fixed mutable default argument
+- Explicit tonnage cleaning in validation
+
+Date: 2026-01-22
+"""
 
 import os
 import sys
@@ -327,7 +343,9 @@ def is_cycle_complete(cycle_df, tonnage_col, press_number=None):
             return True
 
         temps_active_window = temps_window[active_cols]
-        temps_active_ok = temps_active_window.notna().all(axis=1) & (temps_active_window < TC_TEMP_THRESHOLD).all(axis=1)
+        has_any = temps_active_window.notna().any(axis=1)
+        present_below = (temps_active_window < TC_TEMP_THRESHOLD) | temps_active_window.isna()
+        temps_active_ok = has_any & present_below.all(axis=1)
         return tonnage_idle and temps_active_ok.all()
     except Exception:
         return False
@@ -1291,9 +1309,12 @@ def split_into_cycles(df, tc_cols, tonnage_col, press_number=None):
     boundary_mask = pd.Series(False, index=df.index)
     if temps_df is not None and active_cols:
         # boundary is idle-tonnage and either:
-        # - all active TCs are present and <= threshold
+        # - at least one active TC is present and ALL present TCs are <= threshold
+        #   (NaN TCs from masked garbage values like 2498 don't block boundary detection)
         # - OR all TC values are exactly 0 (idle/cool state on some loggers)
-        temps_ok = temps_df[active_cols].notna().all(axis=1) & (temps_df[active_cols] <= TC_TEMP_THRESHOLD).all(axis=1)
+        has_any_tc = temps_df[active_cols].notna().any(axis=1)
+        present_below = (temps_df[active_cols] <= TC_TEMP_THRESHOLD) | temps_df[active_cols].isna()
+        temps_ok = has_any_tc & present_below.all(axis=1)
         all_zero_ok = pd.Series(False, index=df.index)
         try:
             if temps_raw is not None:
