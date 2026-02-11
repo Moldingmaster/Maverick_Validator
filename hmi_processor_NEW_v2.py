@@ -1,20 +1,4 @@
-#!/usr/bin/env python3
-"""
-HMI PROCESSOR WITH NEW CYCLE DETECTION LOGIC - FIXED VERSION v2
-Properly splits production runs based on tonnage and temperature patterns
-Discards waste data between runs
 
-FIXES APPLIED:
-- UTF-16 encoding support for HMI files
-- clean_numeric_column helper to strip null bytes before numeric conversion
-- Column name normalization (strip BOM, null bytes)
-- Fixed lookback logic for leading zeros (iterate backwards)
-- Filter out cycles that never had pressing
-- Fixed mutable default argument
-- Explicit tonnage cleaning in validation
-
-Date: 2026-01-22
-"""
 
 import os
 import sys
