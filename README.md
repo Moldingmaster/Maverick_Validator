@@ -6,32 +6,45 @@ Automated HMI data processor and validation system for Maverick Molding hydrauli
 
 `hmi_processor_NEW_v2.py` runs as a long-lived service that:
 
-1. **Watches** for new or updated HMI data files across Presses 3-8 and Ovens 1-3
+1. **Watches** for new or updated HMI data files across Presses 3–8 and Ovens 1–3
 2. **Parses** tab-delimited press logs and CSV oven logs (with UTF-16 encoding support)
 3. **Detects production cycles** by analyzing tonnage and thermocouple (TC) temperature patterns
-4. **Validates** each cycle against program specifications from Excel reference files
-5. **Generates** PDF reports (time-series charts + data tables) with Pass / Fail / In Progress status
-6. **Creates failure reports** with detailed diagnostics when validation fails
+4. **Stitches cross-midnight data** — automatically combines data from adjacent daily files so cycles that span midnight are evaluated as a single continuous cycle
+5. **Validates** each cycle against program specifications from Excel reference files
+6. **Generates** PDF reports (time-series charts + data tables) with Pass / Fail / In Progress status
+7. **Creates failure reports** with detailed diagnostics when validation fails (deleted automatically when a cycle later passes)
+8. **Maintains a results index** — per-press `results_index.csv` and a combined `results_index_all.csv` for reporting
 
 ## Cycle Detection Logic
 
 The processor splits continuous HMI data into discrete production cycles using these rules:
 
-- **Cycle boundaries** are identified when tonnage is idle AND all active thermocouples drop below 399 F for a sustained period (>= 5 minutes)
+- **Cycle boundaries** are identified when tonnage is idle AND all active thermocouples drop below 399°F for a sustained period (≥ 5 minutes)
 - **Part number changes** always create a new cycle boundary
-- **Minimum cycle requirements**: max temperature must reach 600 F and duration must exceed 15 minutes
-- **Adjacent file stitching**: previous/next day's data files are prepended/appended to handle cycles that span midnight
+- **Minimum cycle requirements**: max temperature must reach 600°F and duration must exceed 15 minutes
+- **Cross-midnight file stitching**: data from the previous day's file (up to 2 hours) and next day's file (up to 12 hours) is automatically prepended/appended so cycles that span the midnight file boundary are processed as one complete cycle — no "partial cycle" failures
+- **Duplicate prevention**: only cycles whose start time falls within the original file's time range are processed, preventing the same cycle from being detected in both the original and stitched file
 
 ## Validation
 
-Press cycle validation checks extracted from Excel program specifications:
+Press cycle validation checks are extracted from Excel program specifications:
 
-- **Temperature targets** - all active TCs must reach specified temperature ranges
-- **Tonnage targets** - applied tonnage must match spec (tons/tool x tool quantity, +/- 3% tolerance)
-- **Hold durations** - tonnage + temperature must be sustained for the specified hold time
-- **Soak durations** - continuous time within a temperature band
+- **Temperature targets** — all active TCs must reach specified temperature ranges
+- **Tonnage targets** — applied tonnage (median of pressing period) must match spec within a tolerance band
+  - Default tolerance: **±3%** of calculated total tonnage (tons/tool × tool count)
+  - Dynamic widening: if the observed pressing median is close but just outside ±3%, the tolerance widens automatically up to a maximum of **±6%** to account for normal process variation
+- **Hold durations** — tonnage + temperature must be sustained simultaneously for the specified hold time
+- **Soak durations** — continuous time within a specified temperature band (uses average of active TCs)
+- **Tool count auto-detection** — if the Excel spec doesn't include tool count, the script infers it from the observed pressing median relative to the per-tool spec
 
 Oven validation checks ramp rates, soak temperatures, soak durations, and hold conditions.
+
+## Failure Reports
+
+- A `FAILURE_REPORT.txt` is created in the result folder only when a cycle **fails** validation
+- Contains: press number, part number, failure reasons, actual vs. expected data, and cycle time range
+- **Automatically deleted** when a cycle is re-evaluated and passes (no manual cleanup needed)
+- No archived failure reports are retained — only the current status matters
 
 ## Status Outcomes
 
@@ -55,11 +68,14 @@ C:\HMI_Upload\
   PythonScripts\        # This script + Excel reference files
 
 M:\Quality\Press Charts\
+  results_index_all.csv   # Combined index of all press cycle results
   Press_3\
+    results_index.csv     # Per-press index of cycle results
     Results_<part>_<date>_<time>\
       chart.pdf           # Time-series chart with validation status
-      <original_file>.txt # Filtered cycle data
+      STATUS.txt          # Current pass/fail/in-progress status
       FAILURE_REPORT.txt  # Detailed failure diagnostics (failures only)
+      <original_file>.txt # Filtered cycle data
   ...
 
 M:\Quality\Furnace Chart\
